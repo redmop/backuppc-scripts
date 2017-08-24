@@ -1,0 +1,121 @@
+#!/bin/bash
+#
+# Enrolling a new host into BackupPC.
+# Also provides helpers to print out BackupPC's SSH public key with recommended
+# authorized_keys options and remove hosts.
+
+set -euo pipefail
+
+# Print usage information for this tool.
+show_usage() {
+	cat <<EOF
+Usage: $0 [OPTION]
+   or: $0 HOSTNAME
+   or: $0 -R HOSTNAME
+Adds or removes the client HOSTNAME to BackupPC.
+
+   -h, --help       show usage
+   -k, --ssh-key    print ssh public key in a format for authorized_keys
+   -R, --remove     remove the client from BackupPC
+
+Client requirements:
+ - BackupPC SSH public added to root authorized_keys, viewable with the
+   --ssh-key argument to this script.
+ - SSH command is set to /usr/bin/rsync with the 'command' option in
+   authorized_keys.
+ - Must have rsync installed.
+
+Author: Ollie Armstrong <ollie@fubra.com> 2016
+EOF
+}
+
+# Echos everything passed to it to stderr.
+err() {
+	cat <<< "$@" 1>&2;
+}
+
+# Print BackupPC's SSH public key proceeded by a comment and authorized_keys
+# options.
+ssh_key() {
+	public_key=$(</var/lib/BackupPC/.ssh/id_rsa.pub)
+	ip_addresses=$(ip addr | grep inet | awk '{print $2}' | grep -v '127.0.0.1/8' | cut -d'/' -f1 | tr '\n' ',' | sed 's/,$//')
+	ssh_key_preamble="# BackupPC\ncommand=\"/usr/bin/rsync \$SSH_ORIGINAL_COMMAND\",from=\"$ip_addresses\",no-agent-forwarding,no-port-forwarding,no-x11-forwarding"
+
+	echo -e "$ssh_key_preamble $public_key"
+}
+
+# Checks if the client is already enrolled in BackupPC.
+client_exists() {
+	if grep -Pq "^$1 " /etc/BackupPC/hosts; then
+		return 0
+	fi
+
+	return 1
+}
+
+# Add the client into BackupPC.
+add_client() {
+	client_hostname=$1
+
+	# Accept the client's ssh host key
+	sudo -u backuppc ssh -q -o StrictHostKeyChecking=no "root@$client_hostname" -- --help >/dev/null
+
+	# Add client to BackupPC hosts file
+	echo "$client_hostname 0 root" >>/etc/BackupPC/hosts
+}
+
+# Removes a client from BackupPC.
+remove_client() {
+	client_hostname=$1
+
+	sed -i "/^$client_hostname\s/d" /etc/BackupPC/hosts
+	sed -i "/^$client_hostname,/d" /var/lib/BackupPC/.ssh/known_hosts
+
+	# Remove client backups
+	if [ -d "/var/lib/BackupPC/pc/$client_hostname" ]; then
+		rm -rf "/var/lib/BackupPC/pc/$client_hostname"
+	fi
+
+	# Remove client specific config
+	if [ -f "/etc/BackupPC/pc/${client_hostname}.pl" ]; then
+		rm "/etc/BackupPC/pc/${client_hostname}.pl"
+	fi
+	
+	echo "Removed ${client_hostname}, it'll remain in BackupPC until the next wakeup."
+	echo "Now remove the SSH key from the client."
+}
+
+if [ "$#" -eq 0 ]; then
+	show_usage
+	exit 1
+fi
+
+while :; do
+	case $1 in
+		-h|--help)
+			show_usage
+			exit
+			;;
+		-k|--ssh-key)
+			ssh_key
+			exit
+			;;
+		-R|--remove)
+			shift
+			remove_client $1
+			exit
+			;;
+		*)
+			break
+	esac
+
+	shift
+done
+
+if client_exists $1; then
+	err "Host already exists" 
+	exit 2
+fi
+
+add_client $1
+echo "System added, it will be backed up automatically on the next hour."
