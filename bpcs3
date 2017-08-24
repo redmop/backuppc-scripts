@@ -1,0 +1,154 @@
+#!/bin/bash
+#
+# Archives the latest BackupPC backup for each host that it manages to an AWS
+# S3 bucket.
+#
+# Each backup is created using a BackupPC provided binary to archive to a .tar
+# file, which is then compressed using gzip and encrypted with a GPG key before
+# being shipped off to S3.
+#
+# The S3 storage architecture uses a single bucket for every host, with each
+# host getting a directory within that bucket. Each host then has directories
+# for 'monthly' and 'weekly' backups.
+#
+# This script will rotate monthly and weekly backups in order to maintain the X 
+# latest weekly backups and the Y latest monthly backups. Weekly and monthly
+# backups are created identically and only differ conceptually. The latest X
+# backups will always be found in the 'weekly' directory, with previous months
+# being found in the 'monthly' directory. The rotation algorithm is detailed
+# below. The one issue with this algorithm is that for months with N weeks,
+# where N > X, then the monthly backup for that month with not be the first
+# weekly taken and instead will be the (N-X)th weekly.
+#
+# Requirements:
+#   - pigz
+#   - gpg
+#   - awscli
+#   - AWS configured for the BackupPC user with read/write access to the S3
+#     bucket and list access for all buckets
+#
+# Usage: modify configuration variables and run
+#
+# Author: Ollie Armstrong <ollie@fubra.com>
+# October 2016
+
+
+# Rotation algorthim:
+#
+# Let X = number of weekly backups to keep
+# Let Y = number of monthly backups to keep
+#
+# If weekly backups > X
+# 	Let t = oldest weekly backup
+#	If the month that t was taken doesn't have a monthly
+#		Promote t to monthly
+#	Else
+#		Delete t
+#
+# If monthly backups > Y
+#	Delete oldest monthly backup
+
+
+##########################
+# Editable configuration #
+##########################
+
+# The path to the BackupPC tarcreate binary
+bpc_tar_create=/usr/share/BackupPC/bin/BackupPC_tarCreate 
+# The email address of the GPG key to use for encryption
+gpg_email=gpg@example.com
+# The email address of the GPG key to use for signing
+gpg_sign_email=gpg@example.com
+# The name of the S3 bucket to store the archives in
+s3_bucket=some-bucket
+# The count of weekly backups to maintain
+weekly_backups=4
+# The count of monthly backups to maintain
+monthly_backups=12
+
+
+################
+# Stop editing #
+################
+
+# Creates an archive and uploads to S3.
+#
+# $1 the name of the host in BackupPC to archive
+archive_host() {
+	local host="$1"
+
+	# Grab the size of the last full backup of this host to use as an estimate
+	# for the archive size (obviously incorrect, but correct order of magnitude).
+	local -r expected_size="$(grep 'full' /var/lib/BackupPC/pc/$host/backups | cut -f 6 -d $'\t' | tail -n 1)"
+
+	echo Archiving $host, expected size before compression roughly $((expected_size / 1024 / 1024))MB.
+
+	local -r s3_path=s3://${s3_bucket}/${host}/weekly/${host}-$(date +%Y-%m-%d).tar.gz.gpg
+	
+	# Do the archive; compress; sign and encrypt; and upload to S3
+	$bpc_tar_create -h "$host" -n -1 -s / / \
+		| pigz \
+		| gpg --encrypt -r $gpg_email --sign --local-user $gpg_sign_email \
+		| aws s3 cp --expected-size $expected_size - $s3_path
+}
+
+# Rotates the backups for a given host to match the configured retention policy.
+#
+# $1 the name of the host in BackupPC to rotate the backups for
+rotate_host() {
+	host="$1"
+
+	local weekly_backups_count=$(aws s3 ls s3://$s3_bucket/$host/weekly/ | wc -l)
+
+	if [[ "$weekly_backups_count" -gt "$weekly_backups" ]]; then
+		local oldest_weekly_backup=$(aws s3 ls s3://$s3_bucket/$host/weekly/ 2>/dev/null | head -n 1 | awk '{print $4}')
+		local oldest_weekly_year=$(echo "${oldest_weekly_backup#$host-}" | cut -d '-' -f 2)
+		local oldest_weekly_month=$(echo "${oldest_weekly_backup#$host-}" | cut -d '-' -f 3)
+
+		# If we don't have a monthly backup for the same month that the oldest
+		# weekly is, then promote that weekly to a monthly. Otherwise delete it.
+		if ! aws s3 ls s3://$s3_bucket/$host/monthly/ | grep -q "$host-$oldest_weekly_year-$oldest_weekly_month-[0-9][0-9]\.tar\.gz\.gpg"; then
+			aws s3 mv s3://$s3_bucket/$host/weekly/$oldest_weekly_backup s3://$s3_bucket/$host/monthly/
+		else
+			aws s3 rm s3://$s3_bucket/$host/weekly/$oldest_weekly_backup
+		fi
+	fi
+
+	local monthly_backups_count=$(aws s3 ls s3://$s3_bucket/$host/monthly/ | wc -l)
+
+	if [[ "$monthly_backups_count" -gt "$monthly_backups" ]]; then
+		local oldest_monthly_backup=$(aws s3 ls s3://$s3_bucket/$host/monthly/ 2>/dev/null | head -n 1 | awk '{print $4}')
+		aws s3 rm s3://$s3_bucket/$host/monthly/$oldest_monthly_backup
+	fi
+}
+
+# Main entry point to the script
+main() {
+	# Check we are running as the backuppc user
+	if [[ $(whoami) != "backuppc" ]]; then
+		echo This script must be run as the BackupPC user, not $(whoami).
+		exit 1
+	fi
+
+	# Check the encryption key exists
+	if ! gpg -k $gpg_email >/dev/null 2>&1; then
+		echo The public GPG key for $gpg_email was not found.
+		exit 1
+	fi
+
+	# Check ls permissions on the S3 bucket
+	if ! aws s3 ls s3://$s3_bucket >/dev/null; then
+		echo "Unable to list S3 bucket ($s3_bucket) contents, check awscli is configured in ~backuppc/.aws/ and has permissions."
+		exit 1
+	fi
+
+	# Archive every host off to S3
+	echo Starting archive at $(date)
+	for host in $(grep -v '^#' /etc/BackupPC/hosts | tail -n +3 | awk '{print $1}'); do
+		archive_host "$host"
+		rotate_host "$host"
+	done
+	echo Finished archive at $(date)
+}
+
+main $@
