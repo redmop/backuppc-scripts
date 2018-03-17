@@ -53,7 +53,7 @@ $msg .= "This can occur in the following situations :\n";
 $msg .= " - When a file is in use\n";
 $msg .= " - When a folder / file access permissions too restrictive\n\n";
 $msg .= "In any event, managers are warned ...\n";
-$ccrecipient = "ltsp@rmsel.org";
+$ccrecipient = "user@example.com";
 $subject = "Backup for $client : ok BUT... !";
 if ( $success ){ &sendmail($msg); };
 } else {
@@ -72,13 +72,13 @@ sub sendmail {
 my($msg) = @ _;
 open(MAIL, "|$mailprog -t") && do {
 print MAIL "To: $recipient\n";
-print MAIL "From: westley-backuppc\@rmsel.org\n";
+print MAIL "From: backuppc\@example\n";
 print MAIL "Cc: $ccrecipient\n";
 # print MAIL "Bcc:\n";
 print MAIL "Subject: $subject \n\n";
 print MAIL "$msg\n";
-print MAIL "\nVisit the site regularly <http://westley/backuppc>\n";
-print MAIL "\nContact support : mailto:ltsp\@rmsel.org\n";
+print MAIL "\nVisit the site regularly <https://backuppc/backuppc>\n";
+print MAIL "\nContact support : mailto:user\@example.com\n";
 close (MAIL);
 };
 }
